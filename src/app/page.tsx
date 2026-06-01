@@ -1,65 +1,95 @@
-import Image from "next/image";
+import { Topbar } from '@/components/layout/Topbar';
+import { OverviewClientTable } from '@/components/overview/OverviewClientTable';
 
-export default function Home() {
+export const dynamic = 'force-dynamic';
+
+async function getOverviewData() {
+  try {
+    const { getDb, getLastSync } = await import('@/lib/db');
+    const { getClientStatus } = await import('@/lib/thresholds');
+    const db = getDb();
+    const dateToday = new Date().toISOString().split('T')[0];
+    const lastSync = getLastSync(db, 'full');
+
+    const clients = db.prepare(`SELECT * FROM clients_snapshot ORDER BY client_name`).all() as any[];
+
+    const rows = clients.map((client: any) => {
+      const campaigns = db.prepare(
+        `SELECT COUNT(*) as total, SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END) as active
+         FROM campaigns_snapshot WHERE client_id = ?`
+      ).get(client.client_id) as any;
+
+      const inboxes = db.prepare(
+        `SELECT COUNT(*) as total,
+                SUM(CASE WHEN smtp_status=1 AND imap_status=1 THEN 1 ELSE 0 END) as active,
+                SUM(CASE WHEN smtp_status=0 OR imap_status=0 THEN 1 ELSE 0 END) as disconnected
+         FROM inboxes_snapshot WHERE client_id = ?`
+      ).get(client.client_id) as any;
+
+      const domains = db.prepare(
+        `SELECT COUNT(DISTINCT domain) as total FROM inboxes_snapshot WHERE client_id = ?`
+      ).get(client.client_id) as any;
+
+      const metrics = db.prepare(
+        `SELECT SUM(sent) as sent_7d, SUM(replies) as replies_7d,
+                SUM(COALESCE(positive_replies,0)) as positive_replies_7d,
+                SUM(bounces) as bounces_7d,
+                CASE WHEN SUM(sent)>0 THEN (SUM(replies)*100.0/SUM(sent)) ELSE 0 END as reply_rate,
+                CASE WHEN SUM(sent)>0 THEN (SUM(bounces)*100.0/SUM(sent)) ELSE 0 END as bounce_rate,
+                SUM(CASE WHEN positive_replies IS NOT NULL THEN 1 ELSE 0 END) as has_positive_data
+         FROM campaigns_daily WHERE client_id=? AND date=?`
+      ).get(client.client_id, dateToday) as any;
+
+      const riskDomains = db.prepare(
+        `SELECT COUNT(*) as count FROM domains_daily WHERE client_id=? AND date=? AND status IN ('Risk','Burned')`
+      ).get(client.client_id, dateToday) as any;
+
+      const needsReview = db.prepare(
+        `SELECT COUNT(*) as count FROM campaigns_daily WHERE client_id=? AND date=?
+         AND status_label IN ('Pause Review','Deliverability Risk','Copy/List Issue')`
+      ).get(client.client_id, dateToday) as any;
+
+      const riskCount = riskDomains?.count ?? 0;
+      const disc = inboxes?.disconnected ?? 0;
+      const bounceRate = metrics?.bounce_rate ?? 0;
+      const sent7d = metrics?.sent_7d ?? 0;
+      const positiveReplies = metrics?.positive_replies_7d ?? 0;
+      const hasPositive = (metrics?.has_positive_data ?? 0) > 0;
+
+      return {
+        client_id: client.client_id,
+        client_name: client.client_name,
+        active_campaigns: campaigns?.active ?? 0,
+        active_domains: domains?.total ?? 0,
+        active_inboxes: inboxes?.active ?? 0,
+        sent_7d: sent7d,
+        replies_7d: metrics?.replies_7d ?? 0,
+        positive_replies_7d: hasPositive ? positiveReplies : null,
+        reply_rate: metrics?.reply_rate ?? 0,
+        positive_reply_rate: hasPositive && sent7d > 0 ? (positiveReplies / sent7d) * 100 : null,
+        bounce_rate: bounceRate,
+        risk_domains: riskCount,
+        disconnected_inboxes: disc,
+        campaigns_needing_review: needsReview?.count ?? 0,
+        status: getClientStatus(riskCount, disc, bounceRate),
+      };
+    });
+
+    return { clients: rows, lastSync: lastSync?.finished_at ?? null, synced: !!lastSync };
+  } catch {
+    return { clients: [], lastSync: null, synced: false };
+  }
+}
+
+export default async function OverviewPage() {
+  const data = await getOverviewData();
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <>
+      <Topbar title="Client Overview" subtitle="All clients — last 7 days" />
+      <div className="page-body">
+        <OverviewClientTable data={data} />
+      </div>
+    </>
   );
 }
