@@ -1,81 +1,88 @@
 import { Topbar } from '@/components/layout/Topbar';
 import { OverviewClientTable } from '@/components/overview/OverviewClientTable';
+import { getSmartleadClient } from '@/lib/smartlead/client';
+import { getClientStatus, getCampaignStatusLabel } from '@/lib/thresholds';
+import { today, daysAgo } from '@/lib/live';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 async function getOverviewData() {
   try {
-    const { getDb, getLastSync } = await import('@/lib/db');
-    const { getClientStatus } = await import('@/lib/thresholds');
-    const db = getDb();
-    const dateToday = new Date().toISOString().split('T')[0];
-    const lastSync = getLastSync(db, 'full');
+    const sl = getSmartleadClient();
+    const end = today();
+    const start7 = daysAgo(7);
 
-    const clients = db.prepare(`SELECT * FROM clients_snapshot ORDER BY client_name`).all() as any[];
+    const [clients, campaigns, clientStats, campaignStats, responseStats] = await Promise.all([
+      sl.listClients(),
+      sl.listCampaigns(),
+      sl.getClientOverallStats(start7, end).catch(() => []),
+      sl.getCampaignOverallStats(start7, end).catch(() => []),
+      sl.getCampaignResponseStats(start7, end).catch(() => []),
+    ]);
 
-    const rows = clients.map((client: any) => {
-      const campaigns = db.prepare(
-        `SELECT COUNT(*) as total, SUM(CASE WHEN status='ACTIVE' THEN 1 ELSE 0 END) as active
-         FROM campaigns_snapshot WHERE client_id = ?`
-      ).get(client.client_id) as any;
+    // One domain-health call per client to get per-client domain counts
+    const clientDomainMetrics = await Promise.all(
+      clients.map(c => sl.getDomainHealthMetrics(start7, end, c.id).catch(() => []))
+    );
 
-      const inboxes = db.prepare(
-        `SELECT COUNT(*) as total,
-                SUM(CASE WHEN smtp_status=1 AND imap_status=1 THEN 1 ELSE 0 END) as active,
-                SUM(CASE WHEN smtp_status=0 OR imap_status=0 THEN 1 ELSE 0 END) as disconnected
-         FROM inboxes_snapshot WHERE client_id = ?`
-      ).get(client.client_id) as any;
+    const clientStatsMap = new Map(clientStats.map(s => [s.client_id, s]));
+    const campaignStatsMap = new Map(campaignStats.map(s => [s.campaign_id, s]));
+    const responseMap = new Map(responseStats.map(r => [r.campaign_id, r]));
 
-      const domains = db.prepare(
-        `SELECT COUNT(DISTINCT domain) as total FROM inboxes_snapshot WHERE client_id = ?`
-      ).get(client.client_id) as any;
+    const rows = clients.map((client, idx) => {
+      const cid = client.id;
+      const stats = clientStatsMap.get(cid);
+      const domainMetrics = clientDomainMetrics[idx];
 
-      const metrics = db.prepare(
-        `SELECT SUM(sent) as sent_7d, SUM(replies) as replies_7d,
-                SUM(COALESCE(positive_replies,0)) as positive_replies_7d,
-                SUM(bounces) as bounces_7d,
-                CASE WHEN SUM(sent)>0 THEN (SUM(replies)*100.0/SUM(sent)) ELSE 0 END as reply_rate,
-                CASE WHEN SUM(sent)>0 THEN (SUM(bounces)*100.0/SUM(sent)) ELSE 0 END as bounce_rate,
-                SUM(CASE WHEN positive_replies IS NOT NULL THEN 1 ELSE 0 END) as has_positive_data
-         FROM campaigns_daily WHERE client_id=? AND date=?`
-      ).get(client.client_id, dateToday) as any;
+      const clientCampaigns = campaigns.filter(c => c.client_id === cid);
+      const activeCampaigns = clientCampaigns.filter(c => c.status === 'ACTIVE').length;
 
-      const riskDomains = db.prepare(
-        `SELECT COUNT(*) as count FROM domains_daily WHERE client_id=? AND date=? AND status IN ('Risk','Burned')`
-      ).get(client.client_id, dateToday) as any;
+      const sentCount = stats?.sent_count ?? 0;
+      const replyCount = stats?.reply_count ?? 0;
+      const bounceCount = stats?.bounce_count ?? 0;
+      const replyRate = stats?.reply_rate ?? 0;
+      const bounceRate = stats?.bounce_rate ?? 0;
+      const posRepliesRaw = stats?.positive_reply_count ?? 0;
+      const positiveReplies = posRepliesRaw > 0 ? posRepliesRaw : null;
+      const positiveReplyRate = sentCount > 0 && positiveReplies !== null
+        ? (positiveReplies / sentCount) * 100
+        : null;
 
-      const needsReview = db.prepare(
-        `SELECT COUNT(*) as count FROM campaigns_daily WHERE client_id=? AND date=?
-         AND status_label IN ('Pause Review','Deliverability Risk','Copy/List Issue')`
-      ).get(client.client_id, dateToday) as any;
+      const riskDomains = domainMetrics.filter(d => d.bounce_rate > 3.0).length;
+      const activeDomains = domainMetrics.filter(d => d.sent_count > 0).length;
 
-      const riskCount = riskDomains?.count ?? 0;
-      const disc = inboxes?.disconnected ?? 0;
-      const bounceRate = metrics?.bounce_rate ?? 0;
-      const sent7d = metrics?.sent_7d ?? 0;
-      const positiveReplies = metrics?.positive_replies_7d ?? 0;
-      const hasPositive = (metrics?.has_positive_data ?? 0) > 0;
+      const needsReview = clientCampaigns.filter(c => {
+        const cs = campaignStatsMap.get(c.id);
+        if (!cs) return false;
+        const resp = responseMap.get(c.id);
+        const posRate = cs.sent_count > 0 && resp
+          ? (resp.interested_count / cs.sent_count) * 100
+          : null;
+        const label = getCampaignStatusLabel(cs.sent_count, cs.reply_rate, cs.bounce_rate, posRate);
+        return ['Pause Review', 'Deliverability Risk', 'Copy/List Issue'].includes(label);
+      }).length;
 
       return {
-        client_id: client.client_id,
-        client_name: client.client_name,
-        active_campaigns: campaigns?.active ?? 0,
-        active_domains: domains?.total ?? 0,
-        active_inboxes: inboxes?.active ?? 0,
-        sent_7d: sent7d,
-        replies_7d: metrics?.replies_7d ?? 0,
-        positive_replies_7d: hasPositive ? positiveReplies : null,
-        reply_rate: metrics?.reply_rate ?? 0,
-        positive_reply_rate: hasPositive && sent7d > 0 ? (positiveReplies / sent7d) * 100 : null,
+        client_id: cid,
+        client_name: client.name,
+        active_campaigns: activeCampaigns,
+        active_domains: activeDomains,
+        active_inboxes: 0,
+        sent_7d: sentCount,
+        replies_7d: replyCount,
+        positive_replies_7d: positiveReplies,
+        reply_rate: replyRate,
+        positive_reply_rate: positiveReplyRate,
         bounce_rate: bounceRate,
-        risk_domains: riskCount,
-        disconnected_inboxes: disc,
-        campaigns_needing_review: needsReview?.count ?? 0,
-        status: getClientStatus(riskCount, disc, bounceRate),
+        risk_domains: riskDomains,
+        disconnected_inboxes: 0,
+        campaigns_needing_review: needsReview,
+        status: getClientStatus(riskDomains, 0, bounceRate),
       };
     });
 
-    return { clients: rows, lastSync: lastSync?.finished_at ?? null, synced: !!lastSync };
+    return { clients: rows, lastSync: new Date().toISOString(), synced: true };
   } catch {
     return { clients: [], lastSync: null, synced: false };
   }
@@ -83,7 +90,6 @@ async function getOverviewData() {
 
 export default async function OverviewPage() {
   const data = await getOverviewData();
-
   return (
     <>
       <Topbar title="Client Overview" subtitle="All clients — last 7 days" />

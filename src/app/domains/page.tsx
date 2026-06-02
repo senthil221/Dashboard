@@ -1,56 +1,62 @@
 import { Topbar } from '@/components/layout/Topbar';
 import { DomainsTable } from '@/components/domains/DomainsTable';
+import { getSmartleadClient } from '@/lib/smartlead/client';
+import { getDomainStatus } from '@/lib/thresholds';
+import { today, daysAgo, domainAction } from '@/lib/live';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 async function getDomainsData(clientId?: string, status?: string) {
   try {
-    const { getDb, getLastSync } = await import('@/lib/db');
-    const db = getDb();
-    const dateToday = new Date().toISOString().split('T')[0];
-    const lastSync = getLastSync(db, 'full');
+    const sl = getSmartleadClient();
+    const end = today();
+    const start7 = daysAgo(7);
+    const cid = clientId ? parseInt(clientId, 10) : undefined;
 
-    let query = `
-      SELECT dd.*,
-             c.client_name,
-             COALESCE(ins.inbox_count, dd.inbox_count, 0) as inbox_count,
-             COALESCE(ins.active_count, dd.active_inbox_count, 0) as active_inbox_count,
-             COALESCE(ins.disc_count, dd.disconnected_inbox_count, 0) as disconnected_inbox_count,
-             COALESCE(ins.warmup_active, dd.warmup_active_count, 0) as warmup_active_count,
-             COALESCE(ins.warmup_inactive, dd.warmup_inactive_count, 0) as warmup_inactive_count,
-             wc.avg_rep as avg_warmup_reputation
-      FROM domains_daily dd
-      LEFT JOIN clients_snapshot c ON dd.client_id = c.client_id
-      LEFT JOIN (
-        SELECT domain, COUNT(*) as inbox_count,
-               SUM(CASE WHEN smtp_status=1 AND imap_status=1 THEN 1 ELSE 0 END) as active_count,
-               SUM(CASE WHEN smtp_status=0 OR imap_status=0 THEN 1 ELSE 0 END) as disc_count,
-               SUM(warmup_status) as warmup_active,
-               SUM(CASE WHEN warmup_status=0 THEN 1 ELSE 0 END) as warmup_inactive
-        FROM inboxes_snapshot GROUP BY domain
-      ) ins ON dd.domain = ins.domain
-      LEFT JOIN (
-        SELECT ins2.domain, AVG(wsc.warmup_reputation) as avg_rep
-        FROM warmup_stats_cache wsc
-        JOIN inboxes_snapshot ins2 ON wsc.email_account_id = ins2.email_account_id
-        GROUP BY ins2.domain
-      ) wc ON dd.domain = wc.domain
-      WHERE dd.date = ?
-    `;
-    const params: (string | number)[] = [dateToday];
+    const [domainMetrics, clients] = await Promise.all([
+      sl.getDomainHealthMetrics(start7, end, cid),
+      sl.listClients().catch(() => []),
+    ]);
 
-    if (clientId) { query += ` AND dd.client_id = ?`; params.push(parseInt(clientId)); }
-    if (status) { query += ` AND dd.status = ?`; params.push(status); }
+    const clientMap = new Map(clients.map(c => [c.id, c.name]));
+    const clientName = cid ? (clientMap.get(cid) ?? undefined) : undefined;
 
-    query += ` ORDER BY
-      CASE dd.status WHEN 'Burned' THEN 1 WHEN 'Risk' THEN 2 WHEN 'Watch' THEN 3 ELSE 4 END,
-      dd.bounce_rate DESC, dd.sent DESC`;
+    const rows = domainMetrics
+      .map(d => {
+        const ds = getDomainStatus(d.bounce_rate, d.reply_rate, 0, 0, d.sent_count);
+        return {
+          domain: d.domain,
+          client_id: cid ?? undefined,
+          client_name: clientName,
+          status: ds,
+          inbox_count: d.inbox_count ?? 0,
+          active_inbox_count: 0,
+          disconnected_inbox_count: 0,
+          warmup_active_count: 0,
+          warmup_inactive_count: 0,
+          avg_warmup_reputation: null as number | null,
+          sent: d.sent_count,
+          replies: d.reply_count,
+          bounces: d.bounce_count,
+          reply_rate: d.reply_rate,
+          bounce_rate: d.bounce_rate,
+          recommended_action: domainAction(ds, d.bounce_rate),
+        };
+      })
+      .filter(d => !status || d.status === status)
+      .sort((a, b) => {
+        const ord = (s: string) => s === 'Burned' ? 0 : s === 'Risk' ? 1 : s === 'Watch' ? 2 : 3;
+        const d = ord(a.status) - ord(b.status);
+        return d !== 0 ? d : b.bounce_rate - a.bounce_rate || b.sent - a.sent;
+      });
 
-    const domains = db.prepare(query).all(...params) as any[];
-
-    const clients = db.prepare(`SELECT client_id, client_name FROM clients_snapshot ORDER BY client_name`).all() as any[];
-
-    return { domains, clients, lastSync: lastSync?.finished_at ?? null, synced: !!lastSync };
+    return {
+      domains: rows,
+      clients: clients.map(c => ({ client_id: c.id, client_name: c.name })),
+      lastSync: new Date().toISOString(),
+      synced: true,
+    };
   } catch {
     return { domains: [], clients: [], lastSync: null, synced: false };
   }

@@ -1,39 +1,72 @@
 import { Topbar } from '@/components/layout/Topbar';
 import { CampaignsTable } from '@/components/campaigns/CampaignsTable';
+import { getSmartleadClient } from '@/lib/smartlead/client';
+import { getCampaignStatusLabel } from '@/lib/thresholds';
+import { today, daysAgo, campaignAction } from '@/lib/live';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 async function getCampaignsData(clientId?: string, status?: string) {
   try {
-    const { getDb, getLastSync } = await import('@/lib/db');
-    const db = getDb();
-    const dateToday = new Date().toISOString().split('T')[0];
-    const lastSync = getLastSync(db, 'full');
+    const sl = getSmartleadClient();
+    const end = today();
+    const start7 = daysAgo(7);
+    const cid = clientId ? parseInt(clientId, 10) : undefined;
 
-    let query = `
-      SELECT cs.campaign_id, cs.campaign_name, cs.status as campaign_status,
-             cs.client_id, c.client_name,
-             cd.sent as sent_7d, cd.replies as replies_7d, cd.positive_replies,
-             cd.bounces, cd.reply_rate, cd.positive_reply_rate, cd.bounce_rate,
-             cd.status_label, cd.recommended_action
-      FROM campaigns_snapshot cs
-      LEFT JOIN clients_snapshot c ON cs.client_id = c.client_id
-      LEFT JOIN campaigns_daily cd ON cs.campaign_id = cd.campaign_id AND cd.date = ?
-      WHERE 1=1
-    `;
-    const params: (string | number)[] = [dateToday];
+    const [campaigns, clients, campaignStats, responseStats] = await Promise.all([
+      sl.listCampaigns(cid),
+      sl.listClients().catch(() => []),
+      sl.getCampaignOverallStats(start7, end, cid).catch(() => []),
+      sl.getCampaignResponseStats(start7, end, cid).catch(() => []),
+    ]);
 
-    if (clientId) { query += ` AND cs.client_id = ?`; params.push(parseInt(clientId)); }
-    if (status) { query += ` AND cs.status = ?`; params.push(status); }
+    const clientMap = new Map(clients.map(c => [c.id, c.name]));
+    const statsMap = new Map(campaignStats.map(s => [s.campaign_id, s]));
+    const responseMap = new Map(responseStats.map(r => [r.campaign_id, r]));
 
-    query += ` ORDER BY
-      CASE cs.status WHEN 'ACTIVE' THEN 1 WHEN 'PAUSED' THEN 2 ELSE 3 END,
-      COALESCE(cd.sent, 0) DESC`;
+    const rows = campaigns
+      .filter(c => !status || c.status === status)
+      .map(c => {
+        const stats = statsMap.get(c.id);
+        const resp = responseMap.get(c.id);
+        const sentCount = stats?.sent_count ?? 0;
+        const replyRate = stats?.reply_rate ?? 0;
+        const bounceRate = stats?.bounce_rate ?? 0;
+        const positiveReplies = resp ? resp.interested_count : null;
+        const positiveReplyRate = sentCount > 0 && positiveReplies !== null
+          ? (positiveReplies / sentCount) * 100
+          : null;
+        const label = getCampaignStatusLabel(sentCount, replyRate, bounceRate, positiveReplyRate);
+        return {
+          campaign_id: c.id,
+          campaign_name: c.name,
+          campaign_status: c.status,
+          client_id: c.client_id ?? undefined,
+          client_name: c.client_id ? (clientMap.get(c.client_id) ?? undefined) : undefined,
+          sent_7d: sentCount,
+          replies_7d: stats?.reply_count ?? 0,
+          positive_replies: positiveReplies,
+          bounces: stats?.bounce_count ?? 0,
+          reply_rate: replyRate,
+          positive_reply_rate: positiveReplyRate,
+          bounce_rate: bounceRate,
+          status_label: label,
+          recommended_action: campaignAction(label),
+        };
+      })
+      .sort((a, b) => {
+        const ord = (s: string) => s === 'ACTIVE' ? 0 : s === 'PAUSED' ? 1 : 2;
+        const d = ord(a.campaign_status) - ord(b.campaign_status);
+        return d !== 0 ? d : b.sent_7d - a.sent_7d;
+      });
 
-    const campaigns = db.prepare(query).all(...params) as any[];
-    const clients = db.prepare(`SELECT client_id, client_name FROM clients_snapshot ORDER BY client_name`).all() as any[];
-
-    return { campaigns, clients, lastSync: lastSync?.finished_at ?? null, synced: !!lastSync };
+    return {
+      campaigns: rows,
+      clients: clients.map(c => ({ client_id: c.id, client_name: c.name })),
+      lastSync: new Date().toISOString(),
+      synced: true,
+    };
   } catch {
     return { campaigns: [], clients: [], lastSync: null, synced: false };
   }

@@ -3,96 +3,114 @@ import { StatCard, StatGrid } from '@/components/ui/StatCards';
 import { StatusBadge, RateBadge, NumCell, DataSourceNote } from '@/components/ui/StatusBadge';
 import Link from 'next/link';
 import { THRESHOLDS } from '@/lib/thresholds';
+import { getClientStatus, getCampaignStatusLabel, getDomainStatus } from '@/lib/thresholds';
 import { notFound } from 'next/navigation';
+import { getSmartleadClient } from '@/lib/smartlead/client';
+import { today, daysAgo, campaignAction, domainAction } from '@/lib/live';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
 async function getClientDetail(id: string) {
   try {
-    const { getDb } = await import('@/lib/db');
-    const { getClientStatus } = await import('@/lib/thresholds');
-    const db = getDb();
+    const sl = getSmartleadClient();
     const clientId = parseInt(id, 10);
     if (isNaN(clientId)) return null;
 
-    const dateToday = new Date().toISOString().split('T')[0];
-    const client = db.prepare(`SELECT * FROM clients_snapshot WHERE client_id = ?`).get(clientId) as any;
+    const end = today();
+    const start7 = daysAgo(7);
+
+    const [clients, campaigns, clientStats, campaignStats, responseStats, domainMetrics] = await Promise.all([
+      sl.listClients().catch(() => []),
+      sl.listCampaigns(clientId).catch(() => []),
+      sl.getClientOverallStats(start7, end).catch(() => []),
+      sl.getCampaignOverallStats(start7, end, clientId).catch(() => []),
+      sl.getCampaignResponseStats(start7, end, clientId).catch(() => []),
+      sl.getDomainHealthMetrics(start7, end, clientId).catch(() => []),
+    ]);
+
+    const client = clients.find(c => c.id === clientId);
     if (!client) return null;
 
-    const metrics = db.prepare(
-      `SELECT SUM(sent) as sent_7d, SUM(replies) as replies_7d,
-              SUM(COALESCE(positive_replies,0)) as positive_replies_7d, SUM(bounces) as bounces_7d,
-              CASE WHEN SUM(sent)>0 THEN (SUM(replies)*100.0/SUM(sent)) ELSE 0 END as reply_rate,
-              CASE WHEN SUM(sent)>0 THEN (SUM(bounces)*100.0/SUM(sent)) ELSE 0 END as bounce_rate,
-              SUM(CASE WHEN positive_replies IS NOT NULL THEN 1 ELSE 0 END) as has_positive_data
-       FROM campaigns_daily WHERE client_id=? AND date=?`
-    ).get(clientId, dateToday) as any;
+    const cStats = clientStats.find(s => s.client_id === clientId);
+    const statsMap = new Map(campaignStats.map(s => [s.campaign_id, s]));
+    const responseMap = new Map(responseStats.map(r => [r.campaign_id, r]));
 
-    const inboxes = db.prepare(
-      `SELECT COUNT(*) as total,
-              SUM(CASE WHEN smtp_status=1 AND imap_status=1 THEN 1 ELSE 0 END) as active,
-              SUM(CASE WHEN smtp_status=0 OR imap_status=0 THEN 1 ELSE 0 END) as disconnected
-       FROM inboxes_snapshot WHERE client_id=?`
-    ).get(clientId) as any;
+    const sentCount = cStats?.sent_count ?? 0;
+    const replyRate = cStats?.reply_rate ?? 0;
+    const bounceRate = cStats?.bounce_rate ?? 0;
+    const posRepliesRaw = cStats?.positive_reply_count ?? 0;
+    const positiveReplies = posRepliesRaw > 0 ? posRepliesRaw : null;
 
-    const domainCount = db.prepare(
-      `SELECT COUNT(DISTINCT domain) as total FROM inboxes_snapshot WHERE client_id=?`
-    ).get(clientId) as any;
+    const riskDomains = domainMetrics.filter(d => d.bounce_rate > THRESHOLDS.bounceRateCritical).length;
+    const activeDomains = domainMetrics.filter(d => d.sent_count > 0).length;
 
-    const riskDomains = db.prepare(
-      `SELECT COUNT(*) as count FROM domains_daily WHERE client_id=? AND date=? AND status IN ('Risk','Burned')`
-    ).get(clientId, dateToday) as any;
+    const campaignRows = campaigns.map(c => {
+      const stats = statsMap.get(c.id);
+      const resp = responseMap.get(c.id);
+      const sent = stats?.sent_count ?? 0;
+      const rr = stats?.reply_rate ?? 0;
+      const br = stats?.bounce_rate ?? 0;
+      const pr = resp ? resp.interested_count : null;
+      const prr = sent > 0 && pr !== null ? (pr / sent) * 100 : null;
+      const label = getCampaignStatusLabel(sent, rr, br, prr);
+      return {
+        campaign_id: c.id,
+        campaign_name: c.name,
+        status: c.status,
+        sent_7d: sent,
+        replies_7d: stats?.reply_count ?? 0,
+        positive_replies: pr,
+        reply_rate: rr,
+        positive_reply_rate: prr,
+        bounce_rate: br,
+        bounces: stats?.bounce_count ?? 0,
+        status_label: label,
+        recommended_action: campaignAction(label),
+      };
+    }).sort((a, b) => b.sent_7d - a.sent_7d);
 
-    const campaigns = db.prepare(
-      `SELECT cs.campaign_id, cs.campaign_name, cs.status,
-              cd.sent as sent_7d, cd.replies as replies_7d, cd.positive_replies,
-              cd.reply_rate, cd.positive_reply_rate, cd.bounce_rate, cd.bounces,
-              cd.status_label, cd.recommended_action
-       FROM campaigns_snapshot cs
-       LEFT JOIN campaigns_daily cd ON cs.campaign_id=cd.campaign_id AND cd.date=?
-       WHERE cs.client_id=?
-       ORDER BY COALESCE(cd.sent,0) DESC, cs.campaign_name`
-    ).all(dateToday, clientId) as any[];
-
-    const domains = db.prepare(
-      `SELECT dd.*,
-              ins.inbox_count, ins.active_count, ins.disc_count, ins.warmup_active, ins.warmup_inactive
-       FROM domains_daily dd
-       LEFT JOIN (
-         SELECT domain,
-           COUNT(*) as inbox_count,
-           SUM(CASE WHEN smtp_status=1 AND imap_status=1 THEN 1 ELSE 0 END) as active_count,
-           SUM(CASE WHEN smtp_status=0 OR imap_status=0 THEN 1 ELSE 0 END) as disc_count,
-           SUM(warmup_status) as warmup_active,
-           SUM(CASE WHEN warmup_status=0 THEN 1 ELSE 0 END) as warmup_inactive
-         FROM inboxes_snapshot WHERE client_id=?
-         GROUP BY domain
-       ) ins ON dd.domain=ins.domain
-       WHERE dd.date=? AND dd.client_id=?
-       ORDER BY dd.bounce_rate DESC, dd.sent DESC`
-    ).all(clientId, dateToday, clientId) as any[];
-
-    const riskCount = riskDomains?.count ?? 0;
-    const disc = inboxes?.disconnected ?? 0;
-    const bounceRate = metrics?.bounce_rate ?? 0;
+    const domainRows = domainMetrics.map(d => {
+      const ds = getDomainStatus(d.bounce_rate, d.reply_rate, 0, 0, d.sent_count);
+      return {
+        domain: d.domain,
+        status: ds,
+        inbox_count: d.inbox_count ?? 0,
+        active_count: 0,
+        disc_count: 0,
+        warmup_active: 0,
+        warmup_inactive: 0,
+        sent: d.sent_count,
+        replies: d.reply_count,
+        bounces: d.bounce_count,
+        reply_rate: d.reply_rate,
+        bounce_rate: d.bounce_rate,
+        recommended_action: domainAction(ds, d.bounce_rate),
+      };
+    }).sort((a, b) => b.bounce_rate - a.bounce_rate || b.sent - a.sent);
 
     return {
-      client: { ...client, status: getClientStatus(riskCount, disc, bounceRate) },
-      metrics: {
-        sent_7d: metrics?.sent_7d ?? 0,
-        replies_7d: metrics?.replies_7d ?? 0,
-        positive_replies_7d: (metrics?.has_positive_data ?? 0) > 0 ? metrics?.positive_replies_7d : null,
-        reply_rate: metrics?.reply_rate ?? 0,
-        bounce_rate: bounceRate,
-        active_campaigns: campaigns.filter((c: any) => c.status === 'ACTIVE').length,
-        total_campaigns: campaigns.length,
-        active_domains: domainCount?.total ?? 0,
-        risk_domains: riskCount,
-        active_inboxes: inboxes?.active ?? 0,
-        disconnected_inboxes: disc,
+      client: {
+        client_id: clientId,
+        client_name: client.name,
+        email: client.email,
+        status: getClientStatus(riskDomains, 0, bounceRate),
       },
-      campaigns,
-      domains,
+      metrics: {
+        sent_7d: sentCount,
+        replies_7d: cStats?.reply_count ?? 0,
+        positive_replies_7d: positiveReplies,
+        reply_rate: replyRate,
+        bounce_rate: bounceRate,
+        active_campaigns: campaigns.filter(c => c.status === 'ACTIVE').length,
+        total_campaigns: campaigns.length,
+        active_domains: activeDomains,
+        risk_domains: riskDomains,
+        active_inboxes: 0,
+        disconnected_inboxes: 0,
+      },
+      campaigns: campaignRows,
+      domains: domainRows,
     };
   } catch {
     return null;
@@ -115,31 +133,28 @@ export default async function ClientDetailPage({ params }: { params: Promise<{ i
         subtitle={`Client ID ${client.client_id} · ${client.email}`}
       />
       <div className="page-body">
-        {/* Breadcrumb */}
         <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 20, display: 'flex', gap: 8 }}>
           <Link href="/" style={{ color: 'var(--text-muted)', textDecoration: 'none' }}>Overview</Link>
           <span>/</span>
           <span style={{ color: 'var(--text-secondary)' }}>{client.client_name}</span>
         </div>
 
-        {/* Status + top metrics */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20 }}>
           <StatusBadge status={client.status} />
           <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
             {metrics.active_campaigns} active campaign{metrics.active_campaigns !== 1 ? 's' : ''} ·{' '}
-            {metrics.active_domains} domain{metrics.active_domains !== 1 ? 's' : ''} ·{' '}
-            {metrics.active_inboxes} inboxes
+            {metrics.active_domains} domain{metrics.active_domains !== 1 ? 's' : ''}
           </span>
         </div>
 
         <StatGrid cols={hasPositive ? 6 : 5}>
           <StatCard label="Sent (7d)" value={metrics.sent_7d?.toLocaleString()}
-            dataSource="Source: /analytics/campaign/overall-stats (last 7 days)" />
+            dataSource="Source: /analytics/client/overall-stats (last 7 days)" />
           <StatCard label="Replies (7d)" value={metrics.replies_7d?.toLocaleString()} />
           {hasPositive && (
             <StatCard label="Pos. Replies (7d)" value={metrics.positive_replies_7d?.toString()}
               valueClass="num-healthy"
-              dataSource="Source: /analytics/campaign/response-stats (interested_count)" />
+              dataSource="Source: /analytics/client/overall-stats (positive_reply_count)" />
           )}
           <StatCard label="Reply Rate" value={`${(metrics.reply_rate ?? 0).toFixed(1)}%`}
             valueClass={metrics.reply_rate < THRESHOLDS.replyRateWarning ? 'num-watch' : 'num-healthy'} />
@@ -148,12 +163,9 @@ export default async function ClientDetailPage({ params }: { params: Promise<{ i
           {metrics.risk_domains > 0 && (
             <StatCard label="Risk Domains" value={metrics.risk_domains} valueClass="num-risk" />
           )}
-          {metrics.disconnected_inboxes > 0 && (
-            <StatCard label="Disconnected" value={metrics.disconnected_inboxes} valueClass="num-watch" />
-          )}
         </StatGrid>
 
-        {/* Campaigns Table */}
+        {/* Campaigns */}
         <div style={{ marginBottom: 32 }}>
           <div className="section-header">
             <div className="section-title">Campaigns</div>
@@ -183,12 +195,11 @@ export default async function ClientDetailPage({ params }: { params: Promise<{ i
                   <tr><td colSpan={12} className="state-empty" style={{ padding: '30px', textAlign: 'center' }}>No campaigns</td></tr>
                 ) : campaigns.map((c: any) => (
                   <tr key={c.campaign_id} className={
-                    c.status_label === 'Pause Review' ? 'row-risk' :
-                    c.status_label === 'Deliverability Risk' ? 'row-risk' :
-                    c.status_label === 'Watch' ? 'row-watch' : 'row-healthy'
+                    c.status_label === 'Pause Review' || c.status_label === 'Deliverability Risk' ? 'row-risk' :
+                    c.status_label === 'Watch' || c.status_label === 'Copy/List Issue' ? 'row-watch' : 'row-healthy'
                   }>
                     <td style={{ maxWidth: 220 }}>
-                      <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <div style={{ fontSize: 13, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {c.campaign_name}
                       </div>
                     </td>
@@ -210,12 +221,12 @@ export default async function ClientDetailPage({ params }: { params: Promise<{ i
           </div>
         </div>
 
-        {/* Domains Table */}
+        {/* Domains */}
         <div>
           <div className="section-header">
             <div className="section-title">Domains</div>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 5 }}>
-              <DataSourceNote note="Source: /analytics/mailbox/domain-wise-health-metrics + /email-accounts/ (for inbox counts)" />
+              <DataSourceNote note="Source: /analytics/mailbox/domain-wise-health-metrics (per client, last 7 days)" />
               Last 7 days
             </div>
           </div>
@@ -225,10 +236,6 @@ export default async function ClientDetailPage({ params }: { params: Promise<{ i
                 <tr>
                   <th>Domain</th>
                   <th>Status</th>
-                  <th>Inboxes</th>
-                  <th>Active</th>
-                  <th>Disconnected</th>
-                  <th>Warmup On</th>
                   <th>Sent 7d</th>
                   <th>Replies</th>
                   <th>Bounces</th>
@@ -239,7 +246,7 @@ export default async function ClientDetailPage({ params }: { params: Promise<{ i
               </thead>
               <tbody>
                 {domains.length === 0 ? (
-                  <tr><td colSpan={12} style={{ padding: '30px', textAlign: 'center', color: 'var(--text-muted)' }}>No domain data. Sync required.</td></tr>
+                  <tr><td colSpan={8} style={{ padding: '30px', textAlign: 'center', color: 'var(--text-muted)' }}>No domain data available.</td></tr>
                 ) : domains.map((d: any) => (
                   <tr key={d.domain} className={
                     d.status === 'Risk' || d.status === 'Burned' ? 'row-risk' :
@@ -256,10 +263,6 @@ export default async function ClientDetailPage({ params }: { params: Promise<{ i
                       </Link>
                     </td>
                     <td><StatusBadge status={d.status} /></td>
-                    <td><NumCell value={d.inbox_count} /></td>
-                    <td><NumCell value={d.active_count} /></td>
-                    <td>{d.disc_count > 0 ? <NumCell value={d.disc_count} className="num-watch" /> : <NumCell value={0} className="num-neutral" />}</td>
-                    <td><NumCell value={d.warmup_active} /></td>
                     <td><NumCell value={d.sent} /></td>
                     <td><NumCell value={d.replies} /></td>
                     <td><NumCell value={d.bounces} /></td>
